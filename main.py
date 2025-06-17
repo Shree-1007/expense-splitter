@@ -14,61 +14,56 @@ db_pool = None
 
 async def init_db():
     global db_pool
-    # Try internal connection first using PG* variables
-    db_user = os.getenv("PGUSER")
-    db_password = os.getenv("PGPASSWORD")
-    db_name = os.getenv("PGDATABASE")
-    db_host = os.getenv("PGHOST")
-    db_port = os.getenv("PGPORT")
+    print("Reading DATABASE_PUBLIC_URL from environment...")
+    db_url = os.getenv("DATABASE_PUBLIC_URL")
+    if not db_url:
+        error_msg = "DATABASE_PUBLIC_URL not set in environment variables"
+        print(error_msg)
+        raise ValueError(error_msg)
+
+    # Parse the database URL
+    print(f"Parsing DATABASE_PUBLIC_URL: {db_url}")
+    parsed_url = urlparse(db_url)
+    db_user = parsed_url.username
+    db_password = parsed_url.password
+    db_name = parsed_url.path.lstrip('/')
+    db_host = parsed_url.hostname
+    db_port = parsed_url.port
+
+    # Log the parsed values for debugging
+    print("Parsed database connection details:")
+    print(f"  User: {db_user}")
+    print(f"  Password: {db_password}")
+    print(f"  Database: {db_name}")
+    print(f"  Host: {db_host}")
+    print(f"  Port: {db_port}")
 
     if not all([db_user, db_password, db_name, db_host, db_port]):
-        missing = [k for k, v in [("PGUSER", db_user), ("PGPASSWORD", db_password),
-                                  ("PGDATABASE", db_name), ("PGHOST", db_host),
-                                  ("PGPORT", db_port)] if not v]
-        raise ValueError(f"Missing environment variables for internal connection: {missing}")
+        error_msg = f"Invalid DATABASE_PUBLIC_URL format: {db_url}"
+        print(error_msg)
+        raise ValueError(error_msg)
 
+    print(f"Connecting to {db_host}:{db_port} with user {db_user}...")
     try:
         db_pool = await asyncpg.create_pool(
             user=db_user,
             password=db_password,
             database=db_name,
             host=db_host,
-            port=int(db_port)
+            port=db_port,
+            command_timeout=10
         )
-        print("Connected to internal database successfully")
+        print("Connected to database successfully")
     except Exception as e:
-        print(f"Internal connection failed: {str(e)}. Falling back to public connection.")
-        # Fallback to public connection using DATABASE_PUBLIC_URL
-        db_url = os.getenv("DATABASE_PUBLIC_URL")
-        if not db_url:
-            raise ValueError(f"Internal connection failed and DATABASE_PUBLIC_URL not set: {str(e)}")
-
-        parsed_url = urlparse(db_url)
-        db_user = parsed_url.username
-        db_password = parsed_url.password
-        db_name = parsed_url.path.lstrip('/')
-        db_host = parsed_url.hostname
-        db_port = parsed_url.port
-
-        if not all([db_user, db_password, db_name, db_host, db_port]):
-            raise ValueError(f"Invalid DATABASE_PUBLIC_URL: {db_url}")
-
-        try:
-            db_pool = await asyncpg.create_pool(
-                user=db_user,
-                password=db_password,
-                database=db_name,
-                host=db_host,
-                port=db_port
-            )
-            print("Connected to public database successfully")
-        except Exception as e2:
-            raise ValueError(f"Failed to connect with both internal and public connections: {str(e2)}")
+        error_msg = f"Failed to connect to database: {str(e)}"
+        print(error_msg)
+        raise ValueError(error_msg)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     async with db_pool.acquire() as conn:
+        print("Creating expenses table if not exists...")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id TEXT PRIMARY KEY,
@@ -78,7 +73,9 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        print("Expenses table created or already exists")
     yield
+    print("Closing database pool...")
     await db_pool.close()
 
 app = FastAPI(title="Expense Splitter API", lifespan=lifespan)
