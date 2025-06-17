@@ -1,70 +1,72 @@
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, validator
-from typing import List, Dict, Optional
-from decimal import Decimal, ROUND_HALF_UP
-import asyncpg
-from uuid import uuid4
 import os
+import asyncpg
+from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+from pydantic import BaseModel, field_validator
+from decimal import Decimal, ROUND_HALF_UP
+from typing import List, Dict
+import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 app = FastAPI(title="Expense Splitter API")
-
-# Database connection pool
 db_pool = None
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(
-        user=os.getenv("DB_USER", "postgres"),
-        password=os.getenv("DB_PASSWORD", "password"),
-        database=os.getenv("DB_NAME", "expense_splitter"),
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", 5432)
-    )
+    # Try internal connection first using PG* variables
+    db_user = os.getenv("PGUSER")
+    db_password = os.getenv("PGPASSWORD")
+    db_name = os.getenv("PGDATABASE")
+    db_host = os.getenv("PGHOST")
+    db_port = os.getenv("PGPORT")
 
-# Models
-class ExpenseCreate(BaseModel):
-    amount: float
-    description: str
-    paid_by: str
+    if not all([db_user, db_password, db_name, db_host, db_port]):
+        missing = [k for k, v in [("PGUSER", db_user), ("PGPASSWORD", db_password),
+                                  ("PGDATABASE", db_name), ("PGHOST", db_host),
+                                  ("PGPORT", db_port)] if not v]
+        raise ValueError(f"Missing environment variables for internal connection: {missing}")
 
-    @validator("amount")
-    def validate_amount(cls, v):
-        if v <= 0:
-            raise ValueError("Amount must be positive")
-        return Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    try:
+        db_pool = await asyncpg.create_pool(
+            user=db_user,
+            password=db_password,
+            database=db_name,
+            host=db_host,
+            port=int(db_port)
+        )
+        print("Connected to internal database successfully")
+    except Exception as e:
+        print(f"Internal connection failed: {str(e)}. Falling back to public connection.")
+        # Fallback to public connection using DATABASE_PUBLIC_URL
+        db_url = os.getenv("DATABASE_PUBLIC_URL")
+        if not db_url:
+            raise ValueError(f"Internal connection failed and DATABASE_PUBLIC_URL not set: {str(e)}")
 
-    @validator("description")
-    def validate_description(cls, v):
-        if not v.strip():
-            raise ValueError("Description cannot be empty")
-        return v
+        parsed_url = urlparse(db_url)
+        db_user = parsed_url.username
+        db_password = parsed_url.password
+        db_name = parsed_url.path.lstrip('/')
+        db_host = parsed_url.hostname
+        db_port = parsed_url.port
 
-    @validator("paid_by")
-    def validate_paid_by(cls, v):
-        if not v.strip():
-            raise ValueError("Paid_by cannot be empty")
-        return v
+        if not all([db_user, db_password, db_name, db_host, db_port]):
+            raise ValueError(f"Invalid DATABASE_PUBLIC_URL: {db_url}")
 
-class ExpenseResponse(BaseModel):
-    id: str
-    amount: float
-    description: str
-    paid_by: str
-    created_at: datetime
+        try:
+            db_pool = await asyncpg.create_pool(
+                user=db_user,
+                password=db_password,
+                database=db_name,
+                host=db_host,
+                port=db_port
+            )
+            print("Connected to public database successfully")
+        except Exception as e2:
+            raise ValueError(f"Failed to connect with both internal and public connections: {str(e2)}")
 
-class BalanceResponse(BaseModel):
-    person: str
-    balance: float
-
-class Settlement(BaseModel):
-    from_person: str
-    to_person: str
-    amount: float
-
-# Database initialization
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await init_db()
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -76,168 +78,166 @@ async def startup_event():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+    yield
+    await db_pool.close()
 
-# Helper functions
-async def get_people():
-    async with db_pool.acquire() as conn:
-        people = await conn.fetch("SELECT DISTINCT paid_by FROM expenses")
-        return [p["paid_by"] for p in people]
+app = FastAPI(title="Expense Splitter API", lifespan=lifespan)
 
-async def calculate_balances():
-    people = await get_people()
-    if not people:
-        return []
-    
-    balances = {person: Decimal("0.00") for person in people}
-    async with db_pool.acquire() as conn:
-        expenses = await conn.fetch("SELECT amount, paid_by FROM expenses")
-    
-    total_spent = sum(Decimal(str(e["amount"])) for e in expenses)
-    if total_spent == 0:
-        return [{"person": p, "balance": 0.00} for p in people]
-    
-    fair_share = total_spent / len(people)
-    
-    for expense in expenses:
-        amount = Decimal(str(expense["amount"]))
-        balances[expense["paid_by"]] += amount
-    
-    return [
-        {"person": p, "balance": float((balances[p] - fair_share).quantize(Decimal("0.01")))}
-        for p in people
-    ]
+class ExpenseCreate(BaseModel):
+    amount: float
+    description: str
+    paid_by: str
 
-async def calculate_settlements():
-    balances = await calculate_balances()
-    if not balances:
-        return []
-    
-    # Create lists of debtors and creditors
-    debtors = [(b["person"], Decimal(str(b["balance"]))) for b in balances if b["balance"] < 0]
-    creditors = [(b["person"], Decimal(str(b["balance"]))) for b in balances if b["balance"] > 0]
-    
-    settlements = []
-    i, j = 0, 0
-    
-    while i < len(debtors) and j < len(creditors):
-        debtor, debt = debtors[i]
-        creditor, credit = creditors[j]
-        amount = min(-debt, credit)
-        
-        if amount > 0:
-            settlements.append({
-                "from_person": debtor,
-                "to_person": creditor,
-                "amount": float(amount.quantize(Decimal("0.01")))
-            })
-        
-        debtors[i] = (debtor, debt + amount)
-        creditors[j] = (creditor, credit - amount)
-        
-        if debtors[i][1] >= 0:
-            i += 1
-        if creditors[j][1] <= 0:
-            j += 1
-    
-    return settlements
+    @field_validator("amount")
+    def validate_amount(cls, v):
+        if v <= 0:
+            raise ValueError("Amount must be positive")
+        return Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-# API Endpoints
-@app.get("/expenses", response_model=Dict[str, List[ExpenseResponse]])
-async def get_expenses():
-    async with db_pool.acquire() as conn:
-        expenses = await conn.fetch("SELECT * FROM expenses")
-    return {
-        "success": True,
-        "data": [dict(e) for e in expenses],
-        "message": "Expenses retrieved successfully"
-    }
+    @field_validator("description")
+    def validate_description(cls, v):
+        if not v.strip():
+            raise ValueError("Description cannot be empty")
+        return v
 
-@app.post("/expenses", response_model=Dict[str, ExpenseResponse])
-async def add_expense(expense: ExpenseCreate):
-    expense_id = str(uuid4())
+    @field_validator("paid_by")
+    def validate_paid_by(cls, v):
+        if not v.strip():
+            raise ValueError("Paid_by cannot be empty")
+        return v
+
+class ExpenseOut(BaseModel):
+    id: str
+    amount: float
+    description: str
+    paid_by: str
+    created_at: datetime
+
+@app.get("/test-db")
+async def test_db():
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        return {"status": "Database connection successful"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
+
+@app.post("/expenses", response_model=ExpenseOut)
+async def create_expense(expense: ExpenseCreate):
+    expense_id = str(uuid.uuid4())
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO expenses (id, amount, description, paid_by)
-            VALUES ($1, $2, $3, $4)
-            """,
-            expense_id, expense.amount, expense.description, expense.paid_by
+            "INSERT INTO expenses (id, amount, description, paid_by) VALUES ($1, $2, $3, $4)",
+            expense_id, float(expense.amount), expense.description, expense.paid_by
         )
-        new_expense = await conn.fetchrow(
-            "SELECT * FROM expenses WHERE id = $1", expense_id
-        )
-    return {
-        "success": True,
-        "data": dict(new_expense),
-        "message": "Expense added successfully"
-    }
+    return {**expense.dict(), "id": expense_id, "created_at": datetime.utcnow()}
 
-@app.put("/expenses/{expense_id}", response_model=Dict[str, ExpenseResponse])
+@app.get("/expenses", response_model=List[ExpenseOut])
+async def get_expenses():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM expenses ORDER BY created_at DESC")
+    return [dict(row) for row in rows]
+
+@app.put("/expenses/{expense_id}", response_model=ExpenseOut)
 async def update_expense(expense_id: str, expense: ExpenseCreate):
     async with db_pool.acquire() as conn:
         result = await conn.fetchrow(
-            """
-            UPDATE expenses 
-            SET amount = $1, description = $2, paid_by = $3
-            WHERE id = $4
-            RETURNING *
-            """,
-            expense.amount, expense.description, expense.paid_by, expense_id
+            "UPDATE expenses SET amount = $1, description = $2, paid_by = $3 WHERE id = $4 RETURNING *",
+            float(expense.amount), expense.description, expense.paid_by, expense_id
         )
         if not result:
             raise HTTPException(status_code=404, detail="Expense not found")
-    return {
-        "success": True,
-        "data": dict(result),
-        "message": "Expense updated successfully"
-    }
+    return dict(result)
 
-@app.delete("/expenses/{expense_id}", response_model=Dict[str, str])
+@app.delete("/expenses/{expense_id}")
 async def delete_expense(expense_id: str):
     async with db_pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM expenses WHERE id = $1", expense_id
-        )
+        result = await conn.execute("DELETE FROM expenses WHERE id = $1", expense_id)
         if result == "DELETE 0":
             raise HTTPException(status_code=404, detail="Expense not found")
-    return {
-        "success": True,
-        "data": "",
-        "message": "Expense deleted successfully"
-    }
+    return {"message": "Expense deleted"}
 
-@app.get("/settlements", response_model=Dict[str, List[Settlement]])
+@app.get("/settlements")
 async def get_settlements():
-    settlements = await calculate_settlements()
-    return {
-        "success": True,
-        "data": settlements,
-        "message": "Settlements calculated successfully"
-    }
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM expenses")
+    
+    if not rows:
+        return {"settlements": []}
 
-@app.get("/balances", response_model=Dict[str, List[BalanceResponse]])
+    total_amount = sum(float(row["amount"]) for row in rows)
+    num_people = len(set(row["paid_by"] for row in rows))
+    if num_people == 0:
+        return {"settlements": []}
+    
+    fair_share = total_amount / num_people
+    balances = {}
+    for row in rows:
+        person = row["paid_by"]
+        amount = float(row["amount"])
+        balances[person] = balances.get(person, 0) + amount
+    
+    for person in balances:
+        balances[person] = balances[person] - fair_share
+    
+    settlements = []
+    debtors = [(person, balance) for person, balance in balances.items() if balance < 0]
+    creditors = [(person, balance) for person, balance in balances.items() if balance > 0]
+    
+    i, j = 0, 0
+    while i < len(debtors) and j < len(creditors):
+        debtor, debt = debtors[i]
+        creditor, credit = creditors[j]
+        debt, credit = abs(debt), abs(credit)
+        
+        amount = min(debt, credit)
+        if amount > 0:
+            settlements.append({
+                "from": debtor,
+                "to": creditor,
+                "amount": round(amount, 2)
+            })
+        
+        debt -= amount
+        credit -= amount
+        
+        if debt <= 0.01:
+            i += 1
+        if credit <= 0.01:
+            j += 1
+        
+        debtors[i] = (debtor, -debt) if i < len(debtors) else None
+        creditors[j] = (creditor, credit) if j < len(creditors) else None
+    
+    return {"settlements": settlements}
+
+@app.get("/balances", response_model=Dict[str, float])
 async def get_balances():
-    balances = await calculate_balances()
-    return {
-        "success": True,
-        "data": balances,
-        "message": "Balances retrieved successfully"
-    }
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM expenses")
+    
+    if not rows:
+        return {}
+    
+    total_amount = sum(float(row["amount"]) for row in rows)
+    num_people = len(set(row["paid_by"] for row in rows))
+    if num_people == 0:
+        return {}
+    
+    fair_share = total_amount / num_people
+    balances = {}
+    for row in rows:
+        person = row["paid_by"]
+        amount = float(row["amount"])
+        balances[person] = balances.get(person, 0) + amount
+    
+    for person in balances:
+        balances[person] = round(balances[person] - fair_share, 2)
+    
+    return balances
 
-@app.get("/people", response_model=Dict[str, List[str]])
-async def get_people_list():
-    people = await get_people()
-    return {
-        "success": True,
-        "data": people,
-        "message": "People retrieved successfully"
-    }
-
-# Error handling
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    return {
-        "success": False,
-        "data": None,
-        "message": str(exc.detail)
-    }, exc.status_code
+@app.get("/people", response_model=List[str])
+async def get_people():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT paid_by FROM expenses")
+    return [row["paid_by"] for row in rows]
